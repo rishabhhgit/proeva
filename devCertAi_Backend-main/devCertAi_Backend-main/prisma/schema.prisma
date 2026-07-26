@@ -1,0 +1,699 @@
+// schema.prisma — Clean, consolidated schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Auth / OTP ──────────────────────────────────────────────────────────────
+
+model OtpStore {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
+model RefreshToken {
+  id          String    @id @default(cuid())
+  token       String    @unique
+  userId      String?
+  recruiterId String?
+  userAgent   String?
+  ip          String?
+  expiresAt   DateTime
+  createdAt   DateTime  @default(now())
+  revokedAt   DateTime?
+
+  user        User?      @relation(fields: [userId],      references: [id], onDelete: Cascade)
+  recruiter   Recruiter? @relation(fields: [recruiterId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([recruiterId])
+  @@index([expiresAt])
+}
+
+// ─── User ────────────────────────────────────────────────────────────────────
+
+model User {
+  id               String    @id @default(cuid())
+  name             String
+  email            String    @unique
+  password         String?
+  googleId         String?   @unique
+  avatar           String?
+  username         String    @unique
+  role             String    @default("user")
+
+  isPremium        Boolean   @default(false)
+  premiumPlan      String?
+  premiumExpiresAt DateTime?
+
+  isEmailVerified  Boolean   @default(false)
+  emailVerifyToken String?
+  resetToken       String?
+  resetTokenExpiry DateTime?
+
+  notifyOnMatch    Boolean   @default(true)
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  applications       Application[]
+  certificates       Certificate[]
+  examAttempts       ExamAttempt[]
+  notifications      Notification[]
+  parsedResume       ParsedResume?
+  payments           Payment[]
+  profileDetail      ProfileDetail?
+  projects           Project[]
+  skills             UserSkill[]
+  credits            UserCredits?
+  creditTransactions CreditTransaction[]
+  refreshTokens      RefreshToken[]
+
+  @@index([email])
+  @@index([role])
+}
+
+// ─── Credit System ───────────────────────────────────────────────────────────
+
+model UserCredits {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  projectEvalLimit Int @default(3)
+  projectEvalUsed  Int @default(0)
+  skillExamLimit   Int @default(1)
+  skillExamUsed    Int @default(0)
+
+  bonusProjectCredits Int      @default(0)
+  bonusSkillCredits   Int      @default(0)
+  bonusExpiresAt      DateTime?
+
+  signupBonusGranted Boolean  @default(false)
+
+  cycleStartedAt DateTime @default(now())
+  cycleResetAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([cycleResetAt])
+}
+
+model CreditTransaction {
+  id     String @id @default(cuid())
+  userId String
+
+  kind   String
+  bucket String?
+  amount Int
+  source String?
+
+  balanceProjectAfter Int?
+  balanceSkillAfter   Int?
+
+  expiresAt DateTime?
+
+  meta      Json?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, kind])
+  @@index([userId, createdAt])
+}
+
+// ─── Payments ────────────────────────────────────────────────────────────────
+
+model Payment {
+  id                String   @id @default(cuid())
+  userId            String
+  razorpayOrderId   String   @unique
+  razorpayPaymentId String?
+  amount            Int
+  currency          String   @default("INR")
+  status            String   @default("pending")
+  plan              String
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ─── Exams ───────────────────────────────────────────────────────────────────
+
+model QuestionBank {
+  id        String  @id @default(cuid())
+  domain    String
+  category  String?
+  phase     Int
+  level     String
+  question  String
+  options   Json?
+  answer    String
+  type      String
+  isActive  Boolean @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([domain, phase, isActive])
+  @@index([domain, category, phase, isActive])
+}
+
+model ExamAttempt {
+  id                String    @id @default(cuid())
+  userId            String
+  domain            String
+  phase             Int
+  status            String    @default("pending")
+
+  phase1Score       Int?
+  phase2Score       Int?
+  totalScore        Int?
+  level             String?
+  difficulty String?
+  questionCount     Int?
+  questions         Json?
+  answers           Json?
+  projectId         String?
+
+  startedAt         DateTime?
+  submittedAt       DateTime?
+  timeLimitSec      Int       @default(2700)
+
+  tabSwitchCount    Int       @default(0)
+  fullscreenExits   Int       @default(0)
+  proctorFlags      Json?
+  terminationReason String?
+
+  evaluationReport  Json?
+  category String?
+
+  applicationId String? @unique
+  source        String?
+
+  createdAt DateTime @default(now())
+
+  certificate   Certificate?
+  application   Application? @relation(fields: [applicationId], references: [id])
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, domain, phase])
+  @@index([applicationId])
+  @@index([status])
+}
+
+// ─── Projects ────────────────────────────────────────────────────────────────
+
+model Project {
+  id               String      @id @default(cuid())
+  userId           String
+  title            String
+  description      String?
+  githubUrl        String?
+  liveUrl          String?
+  zipFileUrl       String?
+  domain           String
+  status           String      @default("pending")
+  score            Int?
+  level            String?
+  evaluationReport Json?
+  plagiarismScore  Float?
+  reEvalCount      Int         @default(0)
+  createdAt        DateTime    @default(now())
+
+  certificate Certificate?
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ─── Certificates ────────────────────────────────────────────────────────────
+
+model Certificate {
+  id             String   @id @default(cuid())
+  userId         String
+  type           String
+  domain         String
+  level          String
+  score          Int
+  projectId      String?  @unique
+  examAttemptId  String?  @unique
+  certificateUrl String?
+  verificationId String   @unique @default(cuid())
+  isPublic       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  difficulty     String?
+  metadata       Json?
+
+  examAttempt ExamAttempt? @relation(fields: [examAttemptId], references: [id])
+  project     Project?     @relation(fields: [projectId],     references: [id])
+  user        User         @relation(fields: [userId],        references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([verificationId])
+}
+
+
+model QuestionBankStats {
+  id        String   @id @default(cuid())
+  domain    String
+  category  String
+  phase     Int
+  level     String
+  count     Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  @@unique([domain, category, phase, level])
+  @@index([domain, phase])
+}
+
+// ─── Notifications ───────────────────────────────────────────────────────────
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String
+  title     String
+  message   String
+  isRead    Boolean  @default(false)
+  data      Json?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@index([createdAt])
+}
+
+// ─── Skills ──────────────────────────────────────────────────────────────────
+
+model Skill {
+  id          String @id @default(cuid())
+  name        String @unique
+  createdAt   DateTime @default(now())
+
+  jobPostings JobPostingSkill[]
+  users       UserSkill[]
+
+  @@index([name])
+}
+
+model UserSkill {
+  id        String   @id @default(cuid())
+  userId    String
+  skillId   String
+  level     String?
+  createdAt DateTime @default(now())
+
+  skill Skill @relation(fields: [skillId], references: [id])
+  user  User  @relation(fields: [userId],  references: [id], onDelete: Cascade)
+
+  @@unique([userId, skillId])
+  @@index([skillId])
+  @@index([userId])
+}
+
+// ─── Recruiter / Company / Jobs ──────────────────────────────────────────────
+
+model Recruiter {
+  id              String @id @default(cuid())
+  name            String
+  email           String @unique
+  password        String
+  avatar          String?
+  isEmailVerified Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  company       Company?
+  jobPostings   JobPosting[]
+  notifications RecruiterNotification[]
+  refreshTokens RefreshToken[]
+
+  @@map("recruiters")
+}
+
+model Company {
+  id                 String  @id @default(cuid())
+  recruiterId        String  @unique
+  name               String
+  website            String?
+  logo               String?
+  industry           String?
+  size               String?
+  description        String?
+  verificationStatus String   @default("unverified")
+  verificationDocUrl String?
+  verificationNote   String?
+  verifiedAt         DateTime?
+  verifiedBy         String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  recruiter   Recruiter    @relation(fields: [recruiterId], references: [id])
+  jobPostings JobPosting[]
+
+  @@index([verificationStatus])
+}
+
+model JobPosting {
+  id            String @id @default(cuid())
+  recruiterId   String
+  companyId     String?
+  title         String
+  description   String
+  companyName   String
+  minExperience Int    @default(0)
+  openings      Int    @default(1)
+
+  ruleScoreThreshold Int @default(60)
+  aiMatchThreshold   Int @default(50)
+
+  assignmentEnabled      Boolean   @default(false)
+  assignmentBrief        String?
+  assignmentEvalCriteria String?
+  assignmentDeadlineDate DateTime?
+  assignmentDeadlineDays Int?
+
+  examEnabled     Boolean @default(true)
+  examPhase1      Boolean @default(true)
+  examPhase2      Boolean @default(false)
+  examDomain      String  @default("Full Stack")
+  examCategory    String?
+  examCategories  Json?
+  examDifficulty  String  @default("mixed")
+  examDurationMin Int     @default(30)
+  examWindowHours Int     @default(48)
+
+  applicationDeadline DateTime?
+
+  manualMode       Boolean @default(false)
+  pipelineStarted  Boolean @default(false)
+  hiringCreditUsed Boolean @default(false)
+
+  scoringWeights   Json?
+  cutoffMode       String @default("count")
+  cutoffPercentage Int?
+
+  matchNotificationCap Int  @default(200)
+  rankingSummary       Json?
+  questionBank         Json?
+
+  status        String @default("draft")
+  applyLinkSlug String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  applications   Application[]
+  company        Company?          @relation(fields: [companyId],   references: [id])
+  recruiter      Recruiter         @relation(fields: [recruiterId], references: [id])
+  requiredSkills JobPostingSkill[]
+
+  @@index([recruiterId])
+  @@index([status])
+  @@index([companyId])
+  @@index([applyLinkSlug])
+  @@index([manualMode])
+}
+
+model JobPostingSkill {
+  id           String  @id @default(cuid())
+  jobPostingId String
+  skillId      String
+  required     Boolean @default(true)
+
+  jobPosting JobPosting @relation(fields: [jobPostingId], references: [id], onDelete: Cascade)
+  skill      Skill      @relation(fields: [skillId],      references: [id])
+
+  @@unique([jobPostingId, skillId])
+  @@index([skillId])
+  @@index([jobPostingId])
+}
+
+// ─── Applications ────────────────────────────────────────────────────────────
+
+model Application {
+  id           String @id @default(cuid())
+  jobPostingId String
+  userId       String
+
+  resumeUrl  String?
+  resumeText String?
+
+  ruleScore     Int?
+  aiMatchScore  Int?
+  aiReasoning   String?
+  missingSkills String[] @default([])
+
+  stage  String @default("applied")
+  status String @default("in_progress")
+
+  rejectionReason    String?
+  selectionNarrative String?
+
+  assignmentSubmissionId String?  @unique
+  assignmentDeadlineAt   DateTime?
+
+  examWindowExpiresAt DateTime?
+  examAttemptId       String?   @unique
+  phase2ExamAttemptId String?   @unique
+
+  projectId    String?
+  projectScore Float?
+  examScore    Float?
+  finalScore   Float?
+  rank         Int?
+
+  assignmentRemindersSent Int @default(0)
+  examRemindersSent       Int @default(0)
+
+  coverNote String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  jobPosting  JobPosting              @relation(fields: [jobPostingId], references: [id], onDelete: Cascade)
+  user        User                    @relation(fields: [userId],       references: [id])
+  messages    ApplicationMessage[]
+  stageEvents ApplicationStageEvent[]
+  examAttempt ExamAttempt?
+  pipelineError String? 
+
+  @@unique([jobPostingId, userId])
+  @@index([jobPostingId])
+  @@index([userId])
+  @@index([stage])
+  @@index([status])
+  @@index([finalScore])
+}
+
+model ApplicationMessage {
+  id            String      @id @default(cuid())
+  applicationId String
+  senderId      String
+  body          String
+  createdAt     DateTime    @default(now())
+  readAt        DateTime?
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+}
+
+model ApplicationStageEvent {
+  id            String      @id @default(cuid())
+  applicationId String
+  stage         String
+  enteredAt     DateTime    @default(now())
+
+  application Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@index([stage])
+}
+
+// ─── Profile ─────────────────────────────────────────────────────────────────
+
+model ParsedResume {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  rawText         String
+  parsedSkills    String[] @default([])
+  experienceYears Float?
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ProfileDetail {
+  id              String  @id @default(cuid())
+  userId          String  @unique
+  phone           String?
+  headline        String?
+  summary         String?
+  location        String?
+  gender          String?
+  dob             DateTime?
+  linkedinUrl     String?
+  githubUrl       String?
+  portfolioUrl    String?
+  cvUrl           String?
+  cvParsedAt      DateTime?
+  extraCurricular String?
+  accomplishments String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  education       Education[]
+  experience      Experience[]
+  certifications  ProfileCertification[]
+  portfolios      ProfilePortfolio[]
+  projects        ProfileProject[]
+  trainings       ProfileTraining[]
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model ProfileTraining {
+  id           String  @id @default(cuid())
+  profileId    String
+  program      String
+  organization String?
+  location     String?
+  isOnline     Boolean  @default(false)
+  startDate    DateTime?
+  endDate      DateTime?
+  isOngoing    Boolean  @default(false)
+  description  String?
+  createdAt    DateTime @default(now())
+
+  profile ProfileDetail @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+}
+
+model ProfileProject {
+  id          String  @id @default(cuid())
+  profileId   String
+  title       String
+  startDate   DateTime?
+  endDate     DateTime?
+  isOngoing   Boolean  @default(false)
+  projectUrl  String?
+  description String?
+  createdAt   DateTime @default(now())
+
+  profile ProfileDetail @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+}
+
+model ProfilePortfolio {
+  id        String  @id @default(cuid())
+  profileId String
+  title     String
+  url       String
+  createdAt DateTime @default(now())
+
+  profile ProfileDetail @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+}
+
+model Education {
+  id           String  @id @default(cuid())
+  profileId    String
+  institution  String
+  degree       String?
+  fieldOfStudy String?
+  startYear    Int?
+  endYear      Int?
+  grade        String?
+  description  String?
+  createdAt    DateTime @default(now())
+
+  profile ProfileDetail @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+}
+
+model Experience {
+  id             String  @id @default(cuid())
+  profileId      String
+  company        String
+  title          String
+  employmentType String?
+  location       String?
+  startDate      DateTime?
+  endDate        DateTime?
+  isCurrent      Boolean  @default(false)
+  description    String?
+  createdAt      DateTime @default(now())
+
+  profile ProfileDetail @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+}
+
+model ProfileCertification {
+  id            String  @id @default(cuid())
+  profileId     String
+  name          String
+  issuer        String?
+  issueDate     DateTime?
+  expiryDate    DateTime?
+  credentialUrl String?
+  createdAt     DateTime @default(now())
+
+  profile ProfileDetail @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+}
+
+// ─── Testimonials ────────────────────────────────────────────────────────────
+
+model Testimonial {
+  id        String  @id @default(cuid())
+  name      String
+  role      String
+  text      String
+  stars     Int     @default(5)
+  avatar    String?
+  isActive  Boolean @default(true)
+  order     Int     @default(0)
+  createdAt DateTime @default(now())
+}
+
+// ─── Notifications ───────────────────────────────────────────────────────────
+
+model RecruiterNotification {
+  id          String   @id @default(cuid())
+  recruiterId String
+  type        String
+  title       String
+  message     String
+  isRead      Boolean  @default(false)
+  data        Json?
+  createdAt   DateTime @default(now())
+
+  recruiter Recruiter @relation(fields: [recruiterId], references: [id], onDelete: Cascade)
+
+  @@index([recruiterId, isRead])
+}
