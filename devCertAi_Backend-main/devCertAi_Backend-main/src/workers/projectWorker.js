@@ -135,6 +135,31 @@ queues.projectEvalQueue.process(async (job) => {
 
     await prisma.project.update({ where: { id: projectId }, data: { status: 'failed' } })
 
+    // Pipeline hook — if this project was submitted as a pipeline assignment,
+    // the application is stuck at 'assignment_submitted' with no way forward.
+    // Set pipelineError so the recruiter sees the issue and can retry or
+    // manually advance the candidate.
+    try {
+      const application = await prisma.application.findFirst({ where: { projectId } })
+      if (application && ['assignment_submitted', 'assignment_sent'].includes(application.stage)) {
+        await prisma.application.update({
+          where: { id: application.id },
+          data: { pipelineError: `Project evaluation failed: ${err.message}` }
+        })
+        const { getIO } = require('../socket')
+        const io = getIO()
+        if (io) {
+          const jp = await prisma.jobPosting.findUnique({ where: { id: application.jobPostingId } })
+          if (jp) {
+            io.to(`recruiter:${jp.recruiterId}`).emit('application:updated', { applicationId: application.id })
+            io.to(`recruiter:${jp.recruiterId}`).emit('posting:updated', { jobPostingId: jp.id })
+          }
+        }
+      }
+    } catch (hookErr) {
+      console.error(`[ProjectWorker] Pipeline failure hook error for project ${projectId}:`, hookErr.message)
+    }
+
     // FIX: a failed evaluation is a pipeline/infra problem, not something
     // the user should pay for — refund the credit that was charged at
     // submission time (see submitProject -> job.data.creditDebit). Free

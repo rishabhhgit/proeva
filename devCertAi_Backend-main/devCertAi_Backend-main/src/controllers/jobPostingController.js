@@ -510,9 +510,33 @@ const triggerRanking = asyncHandler(async (req, res) => {
   const posting = await prisma.jobPosting.findFirst({ where: { id: req.params.id, recruiterId: req.user.id } })
   if (!posting) throw new ApiError(404, 'Posting not found')
 
+  // Check if there are any candidates ready to rank before enqueuing.
+  // Without this, the recruiter sees "rank generated" but the ranking
+  // page shows 0 candidates because no one reached the 'ranked' stage.
+  const rankedCount = await prisma.application.count({
+    where: { jobPostingId: posting.id, stage: 'ranked', status: 'in_progress' }
+  })
+
+  if (rankedCount === 0) {
+    // Also check if there are stuck applications we can surface
+    const stuckCount = await prisma.application.count({
+      where: {
+        jobPostingId: posting.id,
+        status: 'in_progress',
+        stage: { not: 'ranked' }
+      }
+    })
+
+    const detail = stuckCount > 0
+      ? `${stuckCount} application(s) are still in earlier pipeline stages and haven't reached ranking yet.`
+      : 'No applications have been received for this posting yet.'
+
+    throw new ApiError(400, `No candidates ready to rank. ${detail}`)
+  }
+
   await queues.applicationQueue.add({ jobPostingId: posting.id, action: 'rank_posting' }, defaultOpts)
 
-  return res.json(new ApiResponse(200, { message: 'Ranking started' }))
+  return res.json(new ApiResponse(200, { rankedCount }, `Ranking started — ${rankedCount} candidate(s) will be ranked.`))
 })
 
 // POST /recruiter/postings/:id/finalize-selection — recruiter reviews the

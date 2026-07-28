@@ -286,6 +286,40 @@ async function processPendingAdvances() {
   const now = new Date()
   console.log(`[Pipeline] Starting auto-advance check at ${now.toISOString()}`)
 
+  // 0. Retry apps stuck at 'applied' — the initial stage1_screen queue job
+  //    failed silently (inline queue handler error, Redis down, etc.).
+  //    Only pick up apps whose deadline has passed or has no deadline.
+  const stuckApplied = await prisma.application.findMany({
+    where: {
+      stage: 'applied',
+      status: 'in_progress',
+      pipelineError: null,
+      jobPosting: {
+        status: 'active',
+        manualMode: false,
+        OR: [
+          { applicationDeadline: null },
+          { applicationDeadline: { lte: now } }
+        ]
+      }
+    },
+    select: { id: true, jobPostingId: true }
+  })
+
+  console.log(`[Pipeline] Found ${stuckApplied.length} stuck applications at 'applied' stage`)
+  for (const app of stuckApplied) {
+    try {
+      console.log(`[Pipeline] Retrying stuck applied app ${app.id}`)
+      await queues.applicationQueue.add({ applicationId: app.id, action: 'stage1_screen' }, defaultOpts)
+    } catch (err) {
+      console.error(`[Pipeline] Failed to retry stuck applied app ${app.id}:`, err.message)
+      await prisma.application.update({
+        where: { id: app.id },
+        data: { pipelineError: `Retry failed: ${err.message}` }
+      }).catch(() => {})
+    }
+  }
+
   // 1. Auto-advance apps stuck at 'screened' in non-manual mode
   //    (advanceAfterScreening failed silently, e.g. exam creation error)
   const stuckScreened = await prisma.application.findMany({
@@ -330,6 +364,19 @@ async function processPendingAdvances() {
       }
     } catch (err) {
       console.error(`[Pipeline] Auto-advance from project_evaluated failed for app ${app.id}:`, err.message)
+      await prisma.application.update({
+        where: { id: app.id },
+        data: { pipelineError: `Exam creation failed: ${err.message}` }
+      }).catch(() => {})
+      const full = await loadApplicationFull(app.id).catch(() => null)
+      if (full) {
+        await notifyRecruiter(full.jobPosting.recruiterId, {
+          type: 'manual_action_needed',
+          title: `⚠️ Pipeline error for ${full.user.name}`,
+          message: `Auto-advance failed for "${full.jobPosting.title}": ${err.message}`,
+          data: { applicationId: app.id, stage: 'project_evaluated', jobPostingId: full.jobPosting.id }
+        }).catch(() => {})
+      }
     }
   }
 
@@ -356,6 +403,19 @@ async function processPendingAdvances() {
       }
     } catch (err) {
       console.error(`[Pipeline] Auto-advance from exam_completed failed for app ${app.id}:`, err.message)
+      await prisma.application.update({
+        where: { id: app.id },
+        data: { pipelineError: `Phase 2 exam creation failed: ${err.message}` }
+      }).catch(() => {})
+      const full = await loadApplicationFull(app.id).catch(() => null)
+      if (full) {
+        await notifyRecruiter(full.jobPosting.recruiterId, {
+          type: 'manual_action_needed',
+          title: `⚠️ Pipeline error for ${full.user.name}`,
+          message: `Phase 2 exam setup failed for "${full.jobPosting.title}": ${err.message}`,
+          data: { applicationId: app.id, stage: 'exam_completed', jobPostingId: full.jobPosting.id }
+        }).catch(() => {})
+      }
     }
   }
 
@@ -435,6 +495,19 @@ async function closePostingAndProcessApplications(jobPostingId) {
       }
     } catch (err) {
       console.error(`[Pipeline] Failed to advance project_evaluated app on close ${app.id}:`, err.message)
+      await prisma.application.update({
+        where: { id: app.id },
+        data: { pipelineError: `Exam creation failed: ${err.message}` }
+      }).catch(() => {})
+      const full = await loadApplicationFull(app.id).catch(() => null)
+      if (full) {
+        await notifyRecruiter(full.jobPosting.recruiterId, {
+          type: 'manual_action_needed',
+          title: `⚠️ Pipeline error for ${full.user.name}`,
+          message: `Auto-advance failed for "${full.jobPosting.title}" on posting close: ${err.message}`,
+          data: { applicationId: app.id, stage: 'project_evaluated', jobPostingId: full.jobPosting.id }
+        }).catch(() => {})
+      }
     }
   }
 
@@ -455,6 +528,19 @@ async function closePostingAndProcessApplications(jobPostingId) {
       }
     } catch (err) {
       console.error(`[Pipeline] Failed to advance exam_completed app on close ${app.id}:`, err.message)
+      await prisma.application.update({
+        where: { id: app.id },
+        data: { pipelineError: `Phase 2 exam creation failed: ${err.message}` }
+      }).catch(() => {})
+      const full = await loadApplicationFull(app.id).catch(() => null)
+      if (full) {
+        await notifyRecruiter(full.jobPosting.recruiterId, {
+          type: 'manual_action_needed',
+          title: `⚠️ Pipeline error for ${full.user.name}`,
+          message: `Phase 2 exam setup failed for "${full.jobPosting.title}" on posting close: ${err.message}`,
+          data: { applicationId: app.id, stage: 'exam_completed', jobPostingId: full.jobPosting.id }
+        }).catch(() => {})
+      }
     }
   }
 
@@ -858,7 +944,10 @@ async function moveToExamPhase1Sent(applicationId) {
   const application = await loadApplicationFull(applicationId)
   if (!application) return
 
-  // Idempotent: if an exam attempt already exists, just ensure stage is correct
+  // Idempotent: if an exam attempt already exists, just ensure stage is correct.
+  // Check both the application field AND the examAttempt table — if the create
+  // succeeded but the application update failed, the attempt exists but
+  // application.examAttemptId is still null.
   if (application.examAttemptId) {
     if (application.stage !== 'exam_sent') {
       await prisma.application.update({
@@ -867,6 +956,18 @@ async function moveToExamPhase1Sent(applicationId) {
       })
       await recordStageEvent(applicationId, 'exam_sent')
     }
+    return
+  }
+
+  const existingAttempt = await prisma.examAttempt.findFirst({
+    where: { applicationId, source: 'pipeline', phase: 1 }
+  })
+  if (existingAttempt) {
+    await prisma.application.update({
+      where: { id: applicationId },
+      data: { stage: 'exam_sent', examAttemptId: existingAttempt.id }
+    })
+    await recordStageEvent(applicationId, 'exam_sent')
     return
   }
 
@@ -1231,21 +1332,22 @@ async function manualAdvanceStage(applicationId, recruiterId, { targetStage, not
       await markReadyForRanking(applicationId)
     },
     ranked: async () => {
-      // Recruiter can override and select/reject individual candidates
-      if (targetStage === 'selected') {
-        await prisma.application.update({
-          where: { id: applicationId },
-          data: { status: 'selected', selectionNarrative: note || 'Manually selected by recruiter.' }
-        })
-        await recordStageEvent(applicationId, 'selected')
-        await enqueueStatusEmail(applicationId, 'selected')
-        await notifyStudent(application.userId, {
-          type: 'application_selected',
-          title: '🎉 Congratulations! You\'ve been selected!',
-          message: `You have been selected for "${jp.title}".`,
-          data: { applicationId }
-        })
+      if (targetStage !== 'selected') {
+        throw new Error(`Invalid targetStage "${targetStage}" for a ranked application — expected "selected".`)
       }
+      // Recruiter can override and select/reject individual candidates
+      await prisma.application.update({
+        where: { id: applicationId },
+        data: { status: 'selected', selectionNarrative: note || 'Manually selected by recruiter.' }
+      })
+      await recordStageEvent(applicationId, 'selected')
+      await enqueueStatusEmail(applicationId, 'selected')
+      await notifyStudent(application.userId, {
+        type: 'application_selected',
+        title: '🎉 Congratulations! You\'ve been selected!',
+        message: `You have been selected for "${jp.title}".`,
+        data: { applicationId }
+      })
     }
   }
 
@@ -1255,13 +1357,16 @@ async function manualAdvanceStage(applicationId, recruiterId, { targetStage, not
   await handler()
   console.log(`[Pipeline] Manual advance completed for app ${applicationId}`)
 
-  // Notify student that recruiter took action
-  await notifyStudent(application.userId, {
-    type: 'pipeline_stage',
-    title: '📋 Your application moved forward',
-    message: `Recruiter has reviewed your application for "${jp.title}" and moved it to the next stage.`,
-    data: { applicationId, fromStage: currentStage }
-  })
+  // Notify student that recruiter took action — skip for ranked→selected
+  // since the selection notification above already covers it.
+  if (currentStage !== 'ranked') {
+    await notifyStudent(application.userId, {
+      type: 'pipeline_stage',
+      title: '📋 Your application moved forward',
+      message: `Recruiter has reviewed your application for "${jp.title}" and moved it to the next stage.`,
+      data: { applicationId, fromStage: currentStage }
+    })
+  }
   
   // Notify recruiter via socket
   try {

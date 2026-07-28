@@ -68,6 +68,48 @@ const hireCandidate = asyncHandler(async (req, res) => {
     data: { applicationId: application.id, jobPostingId: application.jobPosting.id }
   })
 
+  // Auto-close posting when openings count is reached
+  const posting = await prisma.jobPosting.findUnique({ where: { id: application.jobPostingId } })
+  if (posting && posting.status === 'active') {
+    const selectedCount = await prisma.application.count({
+      where: { jobPostingId: posting.id, status: 'selected' }
+    })
+    const openings = posting.openings || 1
+
+    if (selectedCount >= openings) {
+      // Reject remaining in-progress candidates
+      const remaining = await prisma.application.findMany({
+        where: { jobPostingId: posting.id, status: 'in_progress' },
+        select: { id: true, userId: true }
+      })
+
+      for (const app of remaining) {
+        await prisma.application.update({
+          where: { id: app.id },
+          data: { status: 'rejected', rejectionReason: `Position filled — ${selectedCount} of ${openings} openings accepted.` }
+        }).catch(() => {})
+        await pipelineService.notifyStudent(app.userId, {
+          type: 'application_rejected',
+          title: 'Application update',
+          message: `The position for "${posting.title}" has been filled. We appreciate your time.`,
+          data: { applicationId: app.id }
+        }).catch(() => {})
+      }
+
+      await prisma.jobPosting.update({
+        where: { id: posting.id },
+        data: { status: 'closed' }
+      })
+
+      await pipelineService.notifyRecruiter(posting.recruiterId, {
+        type: 'posting_closed',
+        title: '✅ Posting auto-closed',
+        message: `"${posting.title}" reached ${selectedCount}/${openings} openings — posting closed and remaining candidates notified.`,
+        data: { jobPostingId: posting.id }
+      }).catch(() => {})
+    }
+  }
+
   return res.json(new ApiResponse(200, { application: updated, message: 'Candidate marked as hired' }))
 })
 
@@ -78,21 +120,13 @@ const rejectCandidate = asyncHandler(async (req, res) => {
   if (application.status === 'rejected') {
     return res.json(new ApiResponse(200, { message: 'Candidate already rejected' }))
   }
-
-  try {
-    await pipelineService.manualRejectCandidate(req.params.id, req.user.id, {
-      reason: req.body.reason
-    })
-  } catch (err) {
-    // Fallback to direct update if pipelineService throws
-    await prisma.application.update({
-      where: { id: application.id },
-      data: {
-        status: 'rejected',
-        rejectionReason: req.body.reason || 'Does not meet requirements for this role at this time.'
-      }
-    })
+  if (application.status === 'selected') {
+    throw new ApiError(400, 'Cannot reject a candidate who has already been hired. Undo the hire first if this was a mistake.')
   }
+
+  await pipelineService.manualRejectCandidate(req.params.id, req.user.id, {
+    reason: req.body.reason
+  })
 
   const updated = await prisma.application.findUnique({ where: { id: application.id } })
   return res.json(new ApiResponse(200, { application: updated, message: 'Candidate rejected' }))

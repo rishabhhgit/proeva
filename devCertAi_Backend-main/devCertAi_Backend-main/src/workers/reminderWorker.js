@@ -129,36 +129,43 @@ async function autoRejectExpired(now) {
 // ── retry stuck pipeline applications ───────────────────────────────────────
 
 async function retryStuckPipelineApplications() {
-  // Applications stuck at 'screened' with a pipelineError — retry by
-  // re-enqueuing stage1 which will re-trigger advanceAfterScreening.
+  // Applications stuck at 'screened' or 'applied' with a pipelineError —
+  // retry by re-enqueuing stage1 which will re-trigger the pipeline.
   const stuck = await prisma.application.findMany({
     where: {
-      stage: 'screened',
       status: 'in_progress',
       pipelineError: { not: null },
-      examAttemptId: null,
+      OR: [
+        { stage: 'screened', examAttemptId: null },
+        { stage: 'applied' }
+      ]
     },
-    select: { id: true, pipelineError: true },
+    select: { id: true, pipelineError: true, stage: true },
     take: 10,
   })
 
   for (const app of stuck) {
     try {
-      console.log(`[reminderWorker] Retrying stuck application ${app.id} (was: ${app.pipelineError})`)
+      console.log(`[reminderWorker] Retrying stuck application ${app.id} at stage ${app.stage} (was: ${app.pipelineError})`)
       await prisma.application.update({
         where: { id: app.id },
         data: { pipelineError: null },
       })
-      const full = await prisma.application.findUnique({
-        where: { id: app.id },
-        select: { jobPostingId: true },
-      })
-      if (full) {
-        await prisma.jobPosting.update({
-          where: { id: full.jobPostingId },
-          data: { questionBank: [] },
+
+      if (app.stage === 'screened') {
+        // Reset question bank so the exam is regenerated fresh
+        const full = await prisma.application.findUnique({
+          where: { id: app.id },
+          select: { jobPostingId: true },
         })
+        if (full) {
+          await prisma.jobPosting.update({
+            where: { id: full.jobPostingId },
+            data: { questionBank: [] },
+          })
+        }
       }
+
       await queues.applicationQueue.add(
         { applicationId: app.id, action: 'stage1_screen' },
         defaultOpts
